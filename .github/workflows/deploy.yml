@@ -1,0 +1,54 @@
+name: 部署到宝塔服务器
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: tavily-map-production
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        runs: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login ccr.ccs.tencentyun.com --username=100037066783 --password-stdin
+
+      - name: Build and push Docker image
+        run: |
+          docker build \
+            -t ccr.ccs.tencentyun.com/yjkz/tavily-map:${{ github.sha }} \
+            -t ccr.ccs.tencentyun.com/yjkz/tavily-map:latest \
+            .
+          docker push ccr.ccs.tencentyun.com/yjkz/tavily-map:${{ github.sha }}
+          docker push ccr.ccs.tencentyun.com/yjkz/tavily-map:latest
+
+      - name: Upload deployment Compose file
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          source: deploy/docker-compose.yml
+          target: /home/deploy/tavily-map
+          strip_components: 1
+
+      - name: Deploy to server via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            mkdir -p /home/deploy/tavily-map
+            cd /home/deploy/tavily-map
+            echo "${{ secrets.DOCKER_PASSWORD }}" | docker login ccr.ccs.tencentyun.com --username=100037066783 --password-stdin
+            docker compose pull
+            docker compose up -d

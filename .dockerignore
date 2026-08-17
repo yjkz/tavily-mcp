@@ -1,0 +1,11 @@
+.git
+.venv
+data/
+tests/
+.env
+*.md
+!README.md
+dashboard/node_modules
+dashboard/dist
+__pycache__
+.pytest_cache

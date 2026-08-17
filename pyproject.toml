@@ -1,0 +1,31 @@
+[project]
+name = "tavily-pool-mcp"
+version = "0.1.0"
+description = "Tavily API key pool exposed as an authenticated MCP gateway with a management dashboard"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp>=3.4,<4",
+    "starlette>=0.47",
+    "uvicorn>=0.35",
+    "httpx>=0.28",
+    "aiosqlite>=0.21",
+    "itsdangerous>=2.2",
+    "pydantic>=2.11",
+    "cryptography>=50.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9",
+    "pytest-asyncio>=1.0",
+    "respx>=0.22",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.uv]
+package = false
