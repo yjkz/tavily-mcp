@@ -18,3 +18,5 @@ dashboard/dist/
 # OS / editor
 .DS_Store
 Thumbs.db
+
+go.sh
