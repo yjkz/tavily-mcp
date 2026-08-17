@@ -30,7 +30,13 @@ jobs:
             .
           docker push ccr.ccs.tencentyun.com/yjkz/tavily-map:${{ github.sha }}
           docker push ccr.ccs.tencentyun.com/yjkz/tavily-map:latest
-
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    environment: 腾讯云4h4g
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
       - name: Upload deployment Compose file
         uses: appleboy/scp-action@v1
         with:
