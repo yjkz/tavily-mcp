@@ -11,7 +11,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    environment: production
+    environment: 腾讯云4h4g
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
