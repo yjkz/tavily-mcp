@@ -476,13 +476,16 @@ export default function SettingsPage() {
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="alert-email-from">发件人地址(可选)</Label>
+                <Label htmlFor="alert-email-from">发件人(可选)</Label>
                 <Input
                   id="alert-email-from"
                   value={alert.emailFrom}
                   onChange={(e) => setAlert({ ...alert, emailFrom: e.target.value })}
-                  placeholder="默认同发信邮箱"
+                  placeholder="留空用发信邮箱;可填显示名,如:Tavily Pool 网关"
                 />
+                <p className="text-xs text-muted-foreground">
+                  填显示名时自动以发信邮箱作为实际地址;也可直接填完整格式:名字 &lt;邮箱&gt;
+                </p>
               </div>
               <div className="space-y-2 lg:col-span-3">
                 <Label htmlFor="alert-email-to">收件邮箱</Label>

@@ -22,6 +22,6 @@
 - **双层凭证体系**:上游 Tavily key(池内资源,永不下发)≠ 下发客户端的 `tpm_` 访问 Token(SHA-256 存储,可限流/吊销)
 - **容错调度**:轮询选 key → 429 冷却、432/433 耗尽、401 禁用、5xx 换 key 重试、4xx 直接透传;每 6 小时用 `GET /usage` 校准真实配额
 - **存储**:SQLite(WAL)四张表(`tavily_keys` / `access_tokens` / `request_logs` / `settings`),启动时自动建表和增量迁移
-- **测试**:55 个用例,含真实 uvicorn 线程 + FastMCP 客户端的端到端集成测试
+- **测试**:56 个用例,含真实 uvicorn 线程 + FastMCP 客户端的端到端集成测试
 - **告警**:key 禁用 / 全池不可用 / 阈值告警,飞书/企微/钉钉/通用 Webhook/邮件(SMTP),队列异步发送不阻塞请求
 - **可观测**:日志含查询词与来源 IP;`/metrics` 暴露 Prometheus 指标

@@ -20,16 +20,16 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
-        run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login ccr.ccs.tencentyun.com --username=100037066783 --password-stdin
+        run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login hkccr.ccs.tencentyun.com --username=100037066783 --password-stdin
 
       - name: Build and push Docker image
         run: |
           docker build \
-            -t ccr.ccs.tencentyun.com/yjkz/tavily-map:${{ github.sha }} \
-            -t ccr.ccs.tencentyun.com/yjkz/tavily-map:latest \
+            -t hkccr.ccs.tencentyun.com/yjkz/tavily-mcp:${{ github.sha }} \
+            -t hkccr.ccs.tencentyun.com/yjkz/tavily-mcp:latest \
             .
-          docker push ccr.ccs.tencentyun.com/yjkz/tavily-map:${{ github.sha }}
-          docker push ccr.ccs.tencentyun.com/yjkz/tavily-map:latest
+          docker push hkccr.ccs.tencentyun.com/yjkz/tavily-mcp:${{ github.sha }}
+          docker push hkccr.ccs.tencentyun.com/yjkz/tavily-mcp:latest
   deploy:
     runs-on: ubuntu-latest
     needs: build
@@ -56,6 +56,6 @@ jobs:
           script: |
             mkdir -p /home/deploy/tavily-map
             cd /home/deploy/tavily-map
-            echo "${{ secrets.DOCKER_PASSWORD }}" | docker login ccr.ccs.tencentyun.com --username=100037066783 --password-stdin
+            echo "${{ secrets.DOCKER_PASSWORD }}" | docker login hkccr.ccs.tencentyun.com --username=100037066783 --password-stdin
             docker compose pull
             docker compose up -d

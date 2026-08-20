@@ -120,6 +120,25 @@ async def test_no_url_means_disabled(db, pool):
 # -- email channel -----------------------------------------------------------
 
 
+def test_sender_address_tolerates_display_name():
+    from app.alerts import Alerter
+
+    f = Alerter._sender_address
+    # Empty -> login mailbox.
+    assert f("", "me@163.com") == "me@163.com"
+    # Bare address kept as-is.
+    assert f("other@163.com", "me@163.com") == "other@163.com"
+    # Full "Name <addr>" form kept as-is.
+    assert f("Tavily Pool <me@163.com>", "me@163.com") == "Tavily Pool <me@163.com>"
+    # Display name only -> quoted name paired with the login mailbox.
+    assert (
+        f("Tavily Pool 网关", "me@163.com")
+        == '"Tavily Pool 网关" <me@163.com>'
+    )
+    # Embedded double quotes are neutralized.
+    assert f('bad"name', "me@163.com") == "\"bad'name\" <me@163.com>"
+
+
 async def test_email_channel_delivers(db, pool, monkeypatch):
     await _configure(
         db,

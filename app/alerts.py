@@ -308,13 +308,35 @@ class Alerter:
         """Send via SMTP; blocking smtplib runs on a worker thread."""
         await asyncio.to_thread(self._send_smtp_sync, cfg, subject, body)
 
+    @staticmethod
+    def _sender_address(raw_from: str, username: str) -> str:
+        """Normalize the From value.
+
+        Accepts three forms and tolerates a display-name-only entry:
+          ""                          -> username
+          "a@b.com"                    -> a@b.com
+          "Name <a@b.com>"             -> Name <a@b.com> (display name kept)
+          "Tavily Pool 网关"            -> "Tavily Pool 网关" <username>
+        A bare display name without "<...>" would otherwise be parsed as an
+        (invalid) mailbox and rejected by EmailMessage as a multiple-address
+        / international-address error.
+        """
+        raw = (raw_from or "").strip()
+        if not raw:
+            return username
+        if "@" in raw:
+            return raw
+        # Display name only: quote it and pair with the login mailbox.
+        name = raw.replace('"', "'")
+        return f'"{name}" <{username}>'
+
     def _send_smtp_sync(self, cfg: dict[str, str], subject: str, body: str) -> None:
         host = cfg["alert_email_smtp_host"]
         port = int(cfg["alert_email_smtp_port"] or 465)
         use_ssl = cfg["alert_email_use_ssl"] != "0"
         username = cfg["alert_email_username"]
         password = cfg["alert_email_password"]
-        sender = cfg["alert_email_from"] or username
+        sender = self._sender_address(cfg["alert_email_from"], username)
         recipients = [r.strip() for r in cfg["alert_email_to"].split(",") if r.strip()]
         if not recipients:
             raise ValueError("no recipients configured")
