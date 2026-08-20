@@ -8,9 +8,10 @@ import time
 import pytest
 from fastmcp.exceptions import ToolError
 
-from app.mcp_server import DbTokenVerifier, PooledExecutor, RateLimiter
+import app.mcp_server as mcp_server_module
+from app.mcp_server import DbTokenVerifier, PooledExecutor, RateLimiter, ResearchInput
 from app.tavily import TavilyError
-from tests.conftest import SEARCH_OK, USAGE_OK
+from tests.conftest import RESEARCH_DONE, RESEARCH_PENDING, SEARCH_OK, USAGE_OK
 
 
 async def _insert_token(db, name="dev", tier="standard", rpm=30, **extra) -> int:
@@ -121,3 +122,78 @@ async def test_retry_cap_limits_attempts(executor, state, fake_tavily):
         await executor.run("search", {"query": "hello"})
     assert len(fake_tavily.calls) == 3  # one attempt per key
     assert "failed" in str(exc.value)
+
+
+# -- research: submit with failover, then poll pinned to the same key -------
+
+@pytest.fixture
+def fast_poll(monkeypatch):
+    """Speed up the research polling loop for tests."""
+    monkeypatch.setattr(mcp_server_module, "RESEARCH_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(mcp_server_module, "RESEARCH_TIMEOUTS", {"mini": 0.5, "pro": 0.5, "auto": 0.5})
+
+
+async def test_research_polls_until_completed(executor, state, fake_tavily, fast_poll):
+    fake_tavily.queue("tvly-test-key-a", RESEARCH_PENDING)
+    fake_tavily.default_response = RESEARCH_DONE
+    data = await executor.run_research(ResearchInput(input="test topic"))
+    assert data["status"] == "completed"
+    # POST created the task on key 1, the GET poll reused the same key.
+    assert fake_tavily.calls[0] == ("tvly-test-key-aaaa1111", "/research")
+    assert fake_tavily.calls[1] == ("tvly-test-key-aaaa1111", "/research/req_research_1")
+    ks = state.pool.get(1)
+    assert ks.total_requests == 1
+    assert ks.credits_used_month == 5.0
+    row = await state.db.fetchone(
+        "SELECT tool, status, credits, request_id FROM request_logs ORDER BY id DESC"
+    )
+    assert row["tool"] == "tavily_research"
+    assert row["status"] == "success"
+    assert row["credits"] == 5.0
+    assert row["request_id"] == "req_research_1"
+
+
+async def test_research_post_failover_then_instant_complete(executor, state, fake_tavily, fast_poll):
+    fake_tavily.queue("tvly-test-key-a", TavilyError(429, "excessive requests"))
+    fake_tavily.default_response = RESEARCH_DONE  # next key submits and is done
+    data = await executor.run_research(ResearchInput(input="test topic"))
+    assert data["status"] == "completed"
+    assert state.pool.get(1).effective_status == "cooling"
+    assert len(fake_tavily.calls) == 2  # POST on key A (429) + POST on key B
+
+
+async def test_research_poll_401_disables_key_and_aborts(executor, state, fake_tavily, fast_poll):
+    fake_tavily.queue("tvly-test-key-a", RESEARCH_PENDING)
+    fake_tavily.queue("tvly-test-key-a", TavilyError(401, "invalid api key"))
+    fake_tavily.default_response = RESEARCH_DONE  # must never be reached
+    with pytest.raises(ToolError) as exc:
+        await executor.run_research(ResearchInput(input="test topic"))
+    assert "aborted" in str(exc.value)
+    assert state.pool.get(1).effective_status == "disabled"
+    row = await state.db.fetchone(
+        "SELECT tool, status, http_status FROM request_logs ORDER BY id DESC"
+    )
+    assert row["tool"] == "tavily_research"
+    assert row["status"] == "upstream_error"
+    assert row["http_status"] == 401
+
+
+async def test_query_recorded_in_request_logs(executor, state, fake_tavily):
+    fake_tavily.default_response = SEARCH_OK
+    await executor.run("search", {"query": "what is mcp"})
+    row = await state.db.fetchone("SELECT query FROM request_logs ORDER BY id DESC")
+    assert row["query"] == "what is mcp"
+
+
+async def test_research_timeout_when_never_completing(executor, state, fake_tavily, fast_poll):
+    fake_tavily.default_response = RESEARCH_PENDING  # every poll stays pending
+    with pytest.raises(ToolError) as exc:
+        await executor.run_research(ResearchInput(input="test topic"))
+    assert "did not complete" in str(exc.value)
+    row = await state.db.fetchone(
+        "SELECT tool, status, error_detail FROM request_logs ORDER BY id DESC"
+    )
+    assert row["status"] == "upstream_error"
+    assert "timed out" in row["error_detail"]
+    # No success was ever recorded on the key.
+    assert state.pool.get(1).total_requests == 0

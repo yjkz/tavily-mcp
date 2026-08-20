@@ -8,6 +8,7 @@ Flow for every tools/call request:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import time
@@ -24,12 +25,20 @@ from pydantic import BaseModel, Field
 from typing_extensions import Literal
 
 from .db import Database
+from .metrics import CREDITS, REQUESTS
 from .pool import KeyPool, day_start_ts, month_start_ts
 from .state import AppState
 from .tavily import TavilyClient, TavilyError, parse_usage
 
 TOKEN_PREFIX = "tpm_"
-FULL_TIER_TOOLS = {"tavily_crawl", "tavily_map"}
+FULL_TIER_TOOLS = {"tavily_crawl", "tavily_map", "tavily_research"}
+
+# Research tasks are asynchronous upstream: POST /research returns a
+# request_id (status "pending"), then GET /research/{request_id} is polled
+# until "completed". Poll cadence and per-model total timeouts follow the
+# official Tavily MCP defaults (mini: 120s, pro/auto: 300s).
+RESEARCH_POLL_INTERVAL = 5.0
+RESEARCH_TIMEOUTS = {"mini": 120.0, "pro": 300.0, "auto": 300.0}
 
 READ_ONLY_ANNOTATIONS = {
     "readOnlyHint": True,
@@ -79,7 +88,8 @@ class DbTokenVerifier(TokenVerifier):
             return None
         token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
         row = await self._db.fetchone(
-            "SELECT id, name, tier, rpm_limit, daily_quota, monthly_credits_limit, is_active "
+            "SELECT id, name, tier, allowed_tools, rpm_limit, daily_quota, "
+            "monthly_credits_limit, is_active "
             "FROM access_tokens WHERE token_hash = ?",
             (token_hash,),
         )
@@ -98,6 +108,7 @@ class DbTokenVerifier(TokenVerifier):
                 "token_id": row["id"],
                 "name": row["name"],
                 "tier": row["tier"],
+                "allowed_tools": row["allowed_tools"],
                 "rpm_limit": row["rpm_limit"],
                 "daily_quota": row["daily_quota"],
                 "monthly_credits_limit": row["monthly_credits_limit"],
@@ -148,10 +159,12 @@ async def log_request(
     request_id: Optional[str] = None,
     ts: Optional[float] = None,
     client_ip: Optional[str] = None,
+    query: Optional[str] = None,
 ) -> None:
     await db.execute(
         "INSERT INTO request_logs (ts, token_id, tool, tavily_key_id, status, http_status, "
-        "credits, latency_ms, error_detail, request_id, client_ip) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "credits, latency_ms, error_detail, request_id, client_ip, query) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             ts if ts is not None else time.time(),
             token_id,
@@ -164,8 +177,12 @@ async def log_request(
             error_detail,
             request_id,
             client_ip,
+            query,
         ),
     )
+    REQUESTS.labels(tool=tool, status=status).inc()
+    if status == "success" and credits:
+        CREDITS.inc(credits)
 
 
 class RateLimiter:
@@ -203,7 +220,7 @@ class GatewayMiddleware(Middleware):
         claims = access.claims or {}
         token_id = claims.get("token_id")
 
-        # Tier gate: crawl/map are expensive, full-tier tokens only.
+        # Tier gate: crawl/map/research are expensive, full-tier tokens only.
         if tool in FULL_TIER_TOOLS and claims.get("tier") != "full":
             await log_request(
                 self._db, token_id=token_id, tool=tool, status="tier_denied", client_ip=client_ip,
@@ -214,6 +231,20 @@ class GatewayMiddleware(Middleware):
                 "full-tier token. Ask the gateway administrator or use "
                 "tavily_search / tavily_extract instead."
             )
+
+        # Per-token tool allowlist (comma-separated tool names, NULL = all).
+        allowed = claims.get("allowed_tools")
+        if allowed is not None:
+            permitted = {t.strip() for t in str(allowed).split(",") if t.strip()}
+            if tool != "get_my_usage" and tool not in permitted:
+                await log_request(
+                    self._db, token_id=token_id, tool=tool, status="tier_denied", client_ip=client_ip,
+                    error_detail=f"'{tool}' is not enabled for this token",
+                )
+                raise ToolError(
+                    f"Access denied: '{tool}' is not enabled for this token. "
+                    "Ask the gateway administrator to enable it."
+                )
 
         # Requests-per-minute limit.
         rpm_limit = int(claims.get("rpm_limit") or 30)
@@ -273,6 +304,22 @@ class GatewayMiddleware(Middleware):
 # ---------------------------------------------------------------------------
 
 
+def _query_summary(endpoint: str, payload: dict[str, Any]) -> Optional[str]:
+    """Best-effort summary of what was searched/extracted, for the logs."""
+    if endpoint == "search":
+        q = payload.get("query")
+    elif endpoint == "extract":
+        urls = payload.get("urls") or []
+        q = ", ".join(str(u) for u in urls[:3])
+        if len(urls) > 3:
+            q += f" …(+{len(urls) - 3})"
+    else:  # crawl / map
+        q = payload.get("url")
+    if not q:
+        return None
+    return str(q)[:200]
+
+
 class PooledExecutor:
     def __init__(self, state: AppState):
         self.state = state
@@ -292,13 +339,18 @@ class PooledExecutor:
         except KeyError as e:
             raise ValueError(f"unknown endpoint: {endpoint}") from e
 
-    async def run(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """Call a Tavily endpoint through the key pool with automatic failover."""
+    async def _submit_with_failover(
+        self, call, tool: str, payload: dict[str, Any], query: Optional[str] = None
+    ) -> tuple[Any, dict[str, Any], int]:
+        """Call a Tavily endpoint across pool keys with automatic failover.
+
+        Returns (key_state, response, latency_ms) where latency_ms measures
+        only the winning upstream call. Raises ToolError when the pool is
+        dry, all attempts fail, or the upstream rejected the request (4xx).
+        """
         access = get_access_token()
         token_id = (access.claims or {}).get("token_id") if access else None
         client_ip = get_client_ip()
-        tool = f"tavily_{endpoint}"
-        call = self._endpoint_call(endpoint)
 
         max_attempts = max(1, min(len(self.pool), self.state.config.max_retries))
         started = time.perf_counter()
@@ -333,7 +385,7 @@ class PooledExecutor:
                 await self.pool.report_transient(ks, f"HTTP {e.status}: {e.detail}")
                 await log_request(
                     self.db, token_id=token_id, tool=tool, status="upstream_error",
-                    client_ip=client_ip,
+                    client_ip=client_ip, query=query,
                     tavily_key_id=ks.id, http_status=e.status,
                     latency_ms=int((time.perf_counter() - started) * 1000),
                     error_detail=f"Tavily rejected the request: {e.detail}",
@@ -343,25 +395,13 @@ class PooledExecutor:
                     "Fix the tool arguments and retry."
                 ) from e
 
-            latency_ms = int((time.perf_counter() - t0) * 1000)
-            credits = 0.0
-            usage = data.get("usage") or {}
-            if isinstance(usage, dict) and isinstance(usage.get("credits"), (int, float)):
-                credits = float(usage["credits"])
-            await self.pool.report_success(ks, credits)
-            await log_request(
-                self.db, token_id=token_id, tool=tool, status="success",
-                client_ip=client_ip,
-                tavily_key_id=ks.id, http_status=200, credits=credits,
-                latency_ms=latency_ms, request_id=data.get("request_id"),
-            )
-            return data
+            return ks, data, int((time.perf_counter() - t0) * 1000)
 
         total_ms = int((time.perf_counter() - started) * 1000)
         if attempts == 0:
             await log_request(
                 self.db, token_id=token_id, tool=tool, status="pool_exhausted",
-                client_ip=client_ip,
+                client_ip=client_ip, query=query,
                 latency_ms=total_ms,
                 error_detail="no usable key in pool",
             )
@@ -371,7 +411,7 @@ class PooledExecutor:
             )
         await log_request(
             self.db, token_id=token_id, tool=tool, status="upstream_error",
-            client_ip=client_ip,
+            client_ip=client_ip, query=query,
             tavily_key_id=last_key_id, latency_ms=total_ms,
             error_detail=f"{attempts} attempts failed: " + "; ".join(reasons[-3:]),
         )
@@ -379,6 +419,112 @@ class PooledExecutor:
             f"All Tavily keys failed after {attempts} attempts "
             f"({'; '.join(reasons[-3:])}). Retry later."
         )
+
+    async def run(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Call a Tavily endpoint through the key pool with automatic failover."""
+        access = get_access_token()
+        token_id = (access.claims or {}).get("token_id") if access else None
+        client_ip = get_client_ip()
+        tool = f"tavily_{endpoint}"
+        call = self._endpoint_call(endpoint)
+        query = _query_summary(endpoint, payload)
+
+        ks, data, latency_ms = await self._submit_with_failover(call, tool, payload, query)
+        credits = 0.0
+        usage = data.get("usage") or {}
+        if isinstance(usage, dict) and isinstance(usage.get("credits"), (int, float)):
+            credits = float(usage["credits"])
+        await self.pool.report_success(ks, credits)
+        await log_request(
+            self.db, token_id=token_id, tool=tool, status="success",
+            client_ip=client_ip, query=query,
+            tavily_key_id=ks.id, http_status=200, credits=credits,
+            latency_ms=latency_ms, request_id=data.get("request_id"),
+        )
+        return data
+
+    async def run_research(self, params: "ResearchInput") -> dict[str, Any]:
+        """Submit a /research task and poll it on the same key until done.
+
+        Unlike run(), the polling phase is pinned to the key that created
+        the task: research tasks live in that key's upstream account, so
+        mid-task failover is impossible. Transient poll errors are retried
+        until the per-model timeout; a 401 during polling disables the key
+        and aborts the task.
+        """
+        access = get_access_token()
+        token_id = (access.claims or {}).get("token_id") if access else None
+        client_ip = get_client_ip()
+        tool = "tavily_research"
+        started = time.perf_counter()
+        query = params.input[:200]
+
+        ks, data, _ = await self._submit_with_failover(
+            self.tavily.research, tool, params.payload(), query
+        )
+
+        request_id = data.get("request_id")
+        timeout = RESEARCH_TIMEOUTS.get(params.model, 300.0)
+        deadline = time.monotonic() + timeout
+
+        while data.get("status") != "completed":
+            if data.get("status") == "failed":
+                await self.pool.report_transient(ks, "research task failed upstream")
+                await log_request(
+                    self.db, token_id=token_id, tool=tool, status="upstream_error",
+                    client_ip=client_ip, query=query, tavily_key_id=ks.id,
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    error_detail=f"research task {request_id} failed upstream",
+                )
+                raise ToolError(
+                    "Tavily research task failed upstream. Simplify the topic "
+                    "or retry."
+                )
+            if time.monotonic() >= deadline:
+                await log_request(
+                    self.db, token_id=token_id, tool=tool, status="upstream_error",
+                    client_ip=client_ip, query=query, tavily_key_id=ks.id,
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    error_detail=f"research task {request_id} timed out after {timeout}s",
+                )
+                raise ToolError(
+                    "Tavily research did not complete in time. Retry, or use "
+                    "tavily_search for quick lookups."
+                )
+            await asyncio.sleep(
+                max(0.0, min(RESEARCH_POLL_INTERVAL, deadline - time.monotonic()))
+            )
+            try:
+                data = await self.tavily.get_research(ks.key, request_id)
+            except TavilyError as e:
+                if e.status == 401:
+                    await self.pool.report_invalid(ks, f"401: {e.detail}")
+                    await log_request(
+                        self.db, token_id=token_id, tool=tool, status="upstream_error",
+                        client_ip=client_ip, query=query, tavily_key_id=ks.id, http_status=401,
+                        latency_ms=int((time.perf_counter() - started) * 1000),
+                        error_detail=f"research task {request_id} aborted: {e.detail}",
+                    )
+                    raise ToolError(
+                        "Tavily research aborted: the key became invalid while "
+                        "the task was running."
+                    ) from e
+                # Transient poll error (429/5xx/network): keep waiting.
+                continue
+
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        credits = 0.0
+        usage = data.get("usage") or {}
+        if isinstance(usage, dict) and isinstance(usage.get("credits"), (int, float)):
+            credits = float(usage["credits"])
+        await self.pool.report_success(ks, credits)
+        await log_request(
+            self.db, token_id=token_id, tool=tool, status="success",
+            client_ip=client_ip, query=query,
+            tavily_key_id=ks.id, http_status=200, credits=credits,
+            latency_ms=latency_ms, request_id=request_id,
+        )
+        return data
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +640,45 @@ class MapInput(BaseModel):
         }
 
 
+class ResearchInput(BaseModel):
+    input: str = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+        description="The research topic or question to investigate",
+    )
+    model: Literal["mini", "pro", "auto"] = Field(
+        "auto",
+        description="'mini' is fast and scoped (best for narrow questions); "
+        "'pro' does comprehensive multi-angle research; 'auto' lets Tavily choose",
+    )
+    output_length: Literal["short", "standard", "long"] | None = Field(
+        None, description="Target length of the report (targets, not hard caps)"
+    )
+    citation_format: Literal["numbered", "mla", "apa", "chicago"] | None = Field(
+        None, description="Citation style used in the report"
+    )
+    include_domains: list[str] | None = Field(
+        None, max_length=20,
+        description="Soft preference: sources from these domains are prioritized",
+    )
+    exclude_domains: list[str] | None = Field(
+        None, max_length=20,
+        description="Hard blocklist: no sources from these domains",
+    )
+
+    def payload(self) -> dict[str, Any]:
+        data: dict[str, Any] = {"input": self.input, "model": self.model}
+        optional = {
+            "output_length": self.output_length,
+            "citation_format": self.citation_format,
+            "include_domains": self.include_domains,
+            "exclude_domains": self.exclude_domains,
+        }
+        data.update({k: v for k, v in optional.items() if v is not None})
+        return data
+
+
 def clamp_output(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
@@ -559,6 +744,21 @@ def format_map(data: dict[str, Any]) -> str:
     return "\n".join(urls) if urls else "No URLs found."
 
 
+def format_research(data: dict[str, Any]) -> str:
+    lines: list[str] = []
+    content = (data.get("content") or "").strip()
+    if content:
+        lines.append(content)
+    sources = data.get("sources") or []
+    if sources:
+        lines.append("")
+        lines.append("## Sources")
+        for i, s in enumerate(sources, 1):
+            title = s.get("title") or s.get("url") or "(untitled)"
+            lines.append(f"{i}. {title} — {s.get('url', '')}")
+    return "\n".join(lines).strip() or "Research completed with no content."
+
+
 def build_mcp(state: AppState, lifespan: Any = None) -> FastMCP:
     verifier = DbTokenVerifier(state.db)
     mcp = FastMCP(
@@ -567,8 +767,9 @@ def build_mcp(state: AppState, lifespan: Any = None) -> FastMCP:
         instructions=(
             "Tavily web-search gateway backed by a key pool. Use tavily_search "
             "for web searches, tavily_extract to read specific URLs, "
-            "tavily_crawl / tavily_map (full-tier tokens only) for site-wide "
-            "operations, and get_my_usage to check your own quota."
+            "tavily_crawl / tavily_map / tavily_research (full-tier tokens "
+            "only) for site-wide or deep-research operations, and get_my_usage "
+            "to check your own quota."
         ),
         auth=verifier,
         middleware=[GatewayMiddleware(state.db)],
@@ -648,6 +849,26 @@ def build_mcp(state: AppState, lifespan: Any = None) -> FastMCP:
         """
         data = await executor.run("map", params.payload())
         return clamp_output(format_map(data), limit)
+
+    @mcp.tool(name="tavily_research", annotations={**READ_ONLY_ANNOTATIONS, "title": "Tavily Research"})
+    async def tavily_research(params: ResearchInput) -> str:
+        """Run an autonomous multi-source research task (full-tier tokens only).
+
+        The upstream agent runs many searches and synthesizes a cited report.
+        Slow (up to a few minutes) and expensive in credits: reserve it for
+        topics that genuinely need depth; use tavily_search for quick lookups.
+
+        Args:
+            params: Research question, model ('mini' fast/scoped, 'pro'
+                comprehensive, 'auto' lets Tavily choose), plus optional
+                output length, citation format and domain filters.
+
+        Returns:
+            Markdown research report followed by its cited sources. Use
+            output_length='short' if you only need a brief.
+        """
+        data = await executor.run_research(params)
+        return clamp_output(format_research(data), limit)
 
     @mcp.tool(name="get_my_usage", annotations={
         **READ_ONLY_ANNOTATIONS, "title": "Get My Usage", "openWorldHint": False,

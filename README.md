@@ -25,13 +25,15 @@ MCP 客户端 (Claude Code / Cursor / …)
 
 ## 功能
 
-- **Key 池调度**:轮询均摊消耗;上游 429 自动冷却并换 key 重试,432/433(配额耗尽)自动标记、月初重置并经 `/usage` 校准后恢复,401(无效)禁用并在控制台告警;参数错误(4xx)直接透传不浪费重试。
-- **MCP 工具**:`tavily_search`、`tavily_extract`、`tavily_crawl`、`tavily_map`(crawl/map 需要完整等级 Token)、`get_my_usage`(客户端自查用量)。
-- **鉴权**:你签发的 `tpm_` 前缀 Bearer Token(仅存 SHA-256 哈希,可随时吊销即时生效);每个 Token 独立配置 RPM 限流、日请求配额、月 Credits 上限。
+- **Key 池调度**:轮询均摊消耗;上游 429 自动冷却并换 key 重试,432/433(配额耗尽)自动标记、月初重置并经 `/usage` 校准后恢复,401(无效)禁用并在控制台告警;参数错误(4xx)直接透传不浪费重试。付费 key(>1000 credits/月)完全兼容:配额按 key 可配,且校准会自动回填真实账户限额。
+- **MCP 工具**:`tavily_search`、`tavily_extract`、`tavily_crawl`、`tavily_map`、`tavily_research`(crawl/map/research 需要完整等级 Token;research 为异步深度研究,耗时最长数分钟)、`get_my_usage`(客户端自查用量)。
+- **鉴权**:你签发的 `tpm_` 前缀 Bearer Token(仅存 SHA-256 哈希,可随时吊销即时生效);每个 Token 独立配置 RPM 限流、日请求配额、月 Credits 上限、工具白名单(比 standard/full 等级更细的按工具开关)。
+- **告警通知**:key 被禁用 / 全池不可用 / 可用数量或剩余配额低于阈值时,推送飞书 / 企业微信 / 钉钉(可选签名)/ 通用 Webhook / **邮件(SMTP,支持 163/QQ 等授权码,自定发信与收件邮箱)**;按事件冷却去重防刷屏,控制台可发测试消息。
+- **可观测性**:请求日志含查询内容与来源 IP(审计防滥用);`/metrics` 暴露 Prometheus 指标(请求/credits 计数、池健康)。
 - **Dashboard**(中文界面,默认深色):
   - 概览:今日请求 / 本月 Credits / Key 池健康 / 14 天趋势图 / 池配额总览
-  - Key 池:卡片管理、**测试连接按钮**(零成本验证 key 有效性并校准真实剩余配额)、批量粘贴添加、禁用/启用/删除
-  - 访问 Token:签发(明文仅显示一次)、吊销、限额调整、用量统计
+  - Key 池:卡片管理、**测试连接按钮**(零成本验证 key 有效性并校准真实剩余配额)、**全量校准按钮**(免等 6h 批量校准)、批量粘贴添加、禁用/启用/删除
+  - 访问 Token:签发(明文仅显示一次,可设工具白名单)、吊销、限额调整、用量统计
   - 请求日志:按 Token/状态/工具筛选,分页,保留 30 天
 - **安全**:登录失败 5 次锁定 10 分钟;会话签名 Cookie(HttpOnly);Tavily key 永不下发给客户端。
 
@@ -129,8 +131,8 @@ TAVILY_POOL_DEV=1 uv run uvicorn app.main:app --port 8000
 cd dashboard && npm install && npm run dev
 #   Vite 开发服务器 http://localhost:5173,/api 与 /mcp 已代理到 8000
 
-# 测试
-uv run pytest
+# 测试(必须 python -m,直接 uv run pytest 找不到 app 包)
+uv run python -m pytest
 ```
 
 ## 配置项

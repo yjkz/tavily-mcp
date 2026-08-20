@@ -107,6 +107,24 @@ USAGE_OK = {
     "account": {"current_plan": "Free", "plan_usage": 150, "plan_limit": 1000},
 }
 
+RESEARCH_PENDING = {
+    "request_id": "req_research_1",
+    "status": "pending",
+    "input": "test topic",
+    "model": "auto",
+}
+
+RESEARCH_DONE = {
+    "request_id": "req_research_1",
+    "status": "completed",
+    "content": "# Research Report\n\nKey findings about the test topic.",
+    "sources": [
+        {"title": "Source 1", "url": "https://example.com/1"},
+        {"title": "Source 2", "url": "https://example.com/2"},
+    ],
+    "usage": {"credits": 5.0},
+}
+
 
 @pytest.fixture
 def state(config, db, pool, fake_tavily) -> AppState:

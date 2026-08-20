@@ -1,10 +1,11 @@
 """Application entry point.
 
 One process, one port:
-    /mcp   FastMCP streamable-HTTP endpoint (bearer-token auth)
-    /api   Dashboard admin API (session cookie)
-    /      Dashboard SPA (built frontend, served as static files)
+    /mcp     FastMCP streamable-HTTP endpoint (bearer-token auth)
+    /api     Dashboard admin API (session cookie)
+    /        Dashboard SPA (built frontend, served as static files)
     /health  Liveness probe
+    /metrics Prometheus metrics
 
 The top-level ASGI app is FastMCP's own http_app() with our routes appended,
 so the MCP session manager's lifespan runs in the same lifespan as everything
@@ -24,11 +25,13 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from .admin_api import build_admin_routes
+from .alerts import Alerter
 from .config import load_config
 from .db import Database
+from .metrics import metrics_response
 from .mcp_server import QueryTokenAuthMiddleware, build_mcp
 from .pool import KeyPool
-from .state import AppState, set_state
+from .state import AppState, get_state, set_state
 from .tavily import TavilyClient
 from .tasks import start_background_tasks
 
@@ -41,6 +44,10 @@ async def health(request):
     return JSONResponse({"status": "ok"})
 
 
+async def metrics_handler(request):
+    return await metrics_response(get_state())
+
+
 def create_app():
     config = load_config()
     logging.basicConfig(
@@ -49,9 +56,10 @@ def create_app():
     )
 
     db = Database(config.data_dir / "tavily_pool.db")
-    pool = KeyPool(db, cooldown_seconds=config.cooldown_seconds)
+    alerter = Alerter(db)
+    pool = KeyPool(db, cooldown_seconds=config.cooldown_seconds, alerter=alerter)
     tavily = TavilyClient()
-    state = AppState(config=config, db=db, pool=pool, tavily=tavily)
+    state = AppState(config=config, db=db, pool=pool, tavily=tavily, alerts=alerter)
     set_state(state)
 
     @asynccontextmanager
@@ -59,6 +67,7 @@ def create_app():
         await db.connect()
         await pool.load()
         tasks = start_background_tasks(state)
+        alerter.start()
         logger.info(
             "tavily-pool-mcp started: %d key(s) in pool, MCP at /mcp, dashboard at /",
             len(pool),
@@ -70,11 +79,13 @@ def create_app():
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             await tavily.aclose()
+            await alerter.aclose()
             await db.close()
 
     mcp = build_mcp(state, lifespan=app_lifespan)
     app = mcp.http_app(path="/mcp")
     app.routes.append(Route("/health", health, methods=["GET"]))
+    app.routes.append(Route("/metrics", metrics_handler, methods=["GET"]))
     app.routes.extend(build_admin_routes(config))
     if STATIC_DIR.exists():
         app.routes.append(

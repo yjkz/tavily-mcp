@@ -78,12 +78,22 @@ class KeyState:
 
 
 class KeyPool:
-    def __init__(self, db: Database, cooldown_seconds: float = 60.0):
+    def __init__(self, db: Database, cooldown_seconds: float = 60.0, alerter=None):
         self.db = db
         self.cooldown_seconds = cooldown_seconds
+        self.alerter = alerter  # optional Alerter; fires key/pool health events
         self._keys: list[KeyState] = []
         self._cursor = 0
         self._lock = asyncio.Lock()
+
+    async def _alert_key(self, event: str, ks: KeyState, detail: str) -> None:
+        if self.alerter is not None:
+            await self.alerter.key_event(event, ks, detail)
+            await self.alerter.pool_check(self)
+
+    async def _alert_pool(self) -> None:
+        if self.alerter is not None:
+            await self.alerter.pool_check(self)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -151,18 +161,24 @@ class KeyPool:
         )
 
     async def report_success(self, ks: KeyState, credits: float) -> None:
+        crossed_limit = False
         async with self._lock:
             ks.total_requests += 1
             ks.credits_used_month += credits
             ks.last_used_at = time.time()
             ks.last_error = None
-            if ks.credits_used_month >= ks.plan_limit:
+            if ks.credits_used_month >= ks.plan_limit and ks.status != "exhausted":
                 ks.status = "exhausted"
+                crossed_limit = True
         await self._persist(
             ks,
             "total_requests=?, credits_used_month=?, last_used_at=?, last_error=?, status=?",
             (ks.total_requests, ks.credits_used_month, ks.last_used_at, None, ks.status),
         )
+        if crossed_limit:
+            await self._alert_key(
+                "key_exhausted", ks, "本地计数达到 plan_limit(usage 校准会再核实)"
+            )
 
     async def report_rate_limited(self, ks: KeyState) -> None:
         async with self._lock:
@@ -173,18 +189,21 @@ class KeyPool:
             ks, "status=?, cooldown_until=?, last_error=?",
             (ks.status, ks.cooldown_until, ks.last_error),
         )
+        await self._alert_pool()
 
     async def report_exhausted(self, ks: KeyState, detail: str) -> None:
         async with self._lock:
             ks.status = "exhausted"
             ks.last_error = detail
         await self._persist(ks, "status=?, last_error=?", (ks.status, ks.last_error))
+        await self._alert_key("key_exhausted", ks, detail)
 
     async def report_invalid(self, ks: KeyState, detail: str) -> None:
         async with self._lock:
             ks.status = "disabled"
             ks.last_error = detail
         await self._persist(ks, "status=?, last_error=?", (ks.status, ks.last_error))
+        await self._alert_key("key_disabled", ks, detail)
 
     async def report_transient(self, ks: KeyState, detail: str) -> None:
         """5xx / network error: do not punish the key, just remember the error."""

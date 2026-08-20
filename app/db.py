@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS access_tokens (
     token_hash TEXT NOT NULL UNIQUE,
     prefix TEXT NOT NULL DEFAULT '',
     tier TEXT NOT NULL DEFAULT 'standard',
+    allowed_tools TEXT,
     rpm_limit INTEGER NOT NULL DEFAULT 30,
     daily_quota INTEGER,
     monthly_credits_limit REAL,
@@ -53,7 +54,8 @@ CREATE TABLE IF NOT EXISTS request_logs (
     latency_ms INTEGER,
     error_detail TEXT,
     request_id TEXT,
-    client_ip TEXT
+    client_ip TEXT,
+    query TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_request_logs_ts ON request_logs(ts);
 CREATE INDEX IF NOT EXISTS idx_request_logs_token ON request_logs(token_id, ts);
@@ -93,10 +95,14 @@ class Database:
         names = {r["name"] for r in rows}
         if "token_enc" not in names:
             await self._conn.execute("ALTER TABLE access_tokens ADD COLUMN token_enc TEXT")
+        if "allowed_tools" not in names:
+            await self._conn.execute("ALTER TABLE access_tokens ADD COLUMN allowed_tools TEXT")
         rows = await self.fetchall("PRAGMA table_info(request_logs)")
         names = {r["name"] for r in rows}
         if "client_ip" not in names:
             await self._conn.execute("ALTER TABLE request_logs ADD COLUMN client_ip TEXT")
+        if "query" not in names:
+            await self._conn.execute("ALTER TABLE request_logs ADD COLUMN query TEXT")
 
     async def get_setting(self, key: str) -> Optional[str]:
         row = await self.fetchone("SELECT value FROM settings WHERE key = ?", (key,))

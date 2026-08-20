@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
+from .alerts import Alerter
 from .config import Config
 from .db import Database
 from .pool import KeyPool
@@ -16,6 +18,7 @@ class AppState:
     db: Database
     pool: KeyPool
     tavily: TavilyClient
+    alerts: Optional[Alerter] = None
 
 
 _state: AppState | None = None

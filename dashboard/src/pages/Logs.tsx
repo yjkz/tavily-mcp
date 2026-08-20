@@ -40,7 +40,7 @@ const STATUS_LABEL: Record<string, string> = {
   tier_denied: '等级不足',
 }
 
-const TOOLS = ['tavily_search', 'tavily_extract', 'tavily_crawl', 'tavily_map', 'get_my_usage']
+const TOOLS = ['tavily_search', 'tavily_extract', 'tavily_crawl', 'tavily_map', 'tavily_research', 'get_my_usage']
 
 export default function LogsPage() {
   const [data, setData] = useState<LogsPage | null>(null)
@@ -155,6 +155,7 @@ export default function LogsPage() {
                   <TableHead>时间</TableHead>
                   <TableHead>Token</TableHead>
                   <TableHead>工具</TableHead>
+                  <TableHead>查询内容</TableHead>
                   <TableHead>上游 Key</TableHead>
                   <TableHead>来源 IP</TableHead>
                   <TableHead>状态</TableHead>
@@ -167,7 +168,7 @@ export default function LogsPage() {
               <TableBody>
                 {data.items.length === 0 && (
                   <TableRow>
-                    <TableCell colSpan={10} className="py-10 text-center text-muted-foreground">
+                    <TableCell colSpan={11} className="py-10 text-center text-muted-foreground">
                       没有匹配的日志
                     </TableCell>
                   </TableRow>
@@ -179,6 +180,12 @@ export default function LogsPage() {
                     </TableCell>
                     <TableCell className="max-w-32 truncate">{log.token_name}</TableCell>
                     <TableCell className="font-mono text-xs">{log.tool}</TableCell>
+                    <TableCell
+                      className="max-w-56 truncate text-xs text-muted-foreground"
+                      title={log.query ?? ''}
+                    >
+                      {log.query ?? '-'}
+                    </TableCell>
                     <TableCell className="font-mono text-xs text-muted-foreground">{log.tavily_key}</TableCell>
                     <TableCell className="font-mono text-xs text-muted-foreground">
                       {log.client_ip}

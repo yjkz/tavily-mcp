@@ -120,5 +120,13 @@ class TavilyClient:
     async def map_url(self, api_key: str, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._request("POST", "/map", api_key, payload)
 
+    async def research(self, api_key: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Submit an async research task; returns 201 + {request_id, status, ...}."""
+        return await self._request("POST", "/research", api_key, payload)
+
+    async def get_research(self, api_key: str, request_id: str) -> dict[str, Any]:
+        """Poll a research task; returns {status, content, sources, ...} when done."""
+        return await self._request("GET", f"/research/{request_id}", api_key)
+
     async def usage(self, api_key: str) -> dict[str, Any]:
         return await self._request("GET", "/usage", api_key)

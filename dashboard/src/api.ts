@@ -63,6 +63,7 @@ export interface TokenItem {
   name: string
   prefix: string
   tier: 'standard' | 'full'
+  allowed_tools: string | null
   rpm_limit: number
   daily_quota: number | null
   monthly_credits_limit: number | null
@@ -86,6 +87,7 @@ export interface LogItem {
   ts: number
   token_name: string
   tool: string
+  query: string | null
   tavily_key: string
   status: string
   http_status: number | null
@@ -102,11 +104,30 @@ export interface PublicInfo {
   announcement_updated_at: number | null
 }
 
+export interface AlertConfig {
+  channel: string
+  webhook_url: string
+  webhook_secret: string
+  email_smtp_host: string
+  email_smtp_port: number
+  email_smtp_ssl: boolean
+  email_username: string
+  email_password: string
+  email_from: string
+  email_to: string
+  on_key_disabled: boolean
+  on_key_exhausted: boolean
+  on_pool_exhausted: boolean
+  pool_min_active: number
+  pool_min_remaining: number
+}
+
 export interface SiteSettings {
   site_name: string
   announcement: string
   announcement_updated_at: number | null
   has_custom_icon: boolean
+  alert: AlertConfig
 }
 
 export interface LogsPage {
@@ -160,6 +181,10 @@ export const api = {
   deleteKey: (id: number) => request<{ ok: boolean }>(`/api/keys/${id}`, { method: 'DELETE' }),
   testKey: (id: number) =>
     request<KeyTestResult>(`/api/keys/${id}/test`, { method: 'POST' }),
+  syncAllKeys: () =>
+    request<{ ok: number; failed: number; recovered: number }>('/api/keys/sync-all', {
+      method: 'POST',
+    }),
   tokens: () => request<TokenItem[]>('/api/tokens'),
   createToken: (payload: Record<string, unknown>) =>
     request<CreatedToken>('/api/tokens', {
@@ -176,10 +201,32 @@ export const api = {
     request<{ token: string | null; reason?: string }>(`/api/tokens/${id}/reveal`),
   publicInfo: () => request<PublicInfo>('/api/public-info'),
   getSettings: () => request<SiteSettings>('/api/settings'),
-  updateSettings: (payload: { site_name?: string; announcement?: string }) =>
+  updateSettings: (payload: {
+    site_name?: string
+    announcement?: string
+    alert_channel?: string
+    alert_webhook_url?: string
+    alert_webhook_secret?: string
+    alert_email_smtp_host?: string
+    alert_email_smtp_port?: number
+    alert_email_smtp_ssl?: boolean
+    alert_email_username?: string
+    alert_email_password?: string
+    alert_email_from?: string
+    alert_email_to?: string
+    alert_on_key_disabled?: boolean
+    alert_on_key_exhausted?: boolean
+    alert_on_pool_exhausted?: boolean
+    alert_pool_min_active?: number
+    alert_pool_min_remaining?: number
+  }) =>
     request<{ ok: boolean }>('/api/settings', {
       method: 'PUT',
       body: JSON.stringify(payload),
+    }),
+  alertTest: () =>
+    request<{ ok: boolean; error: string | null }>('/api/settings/alert-test', {
+      method: 'POST',
     }),
   uploadIcon: async (file: File) => {
     const resp = await fetch('/api/settings/icon', {

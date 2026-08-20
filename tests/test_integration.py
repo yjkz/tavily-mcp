@@ -25,7 +25,7 @@ from app.pool import KeyPool
 from app.state import AppState, set_state
 from app.tavily import TavilyError
 from app.tasks import start_background_tasks
-from tests.conftest import SEARCH_OK, USAGE_OK
+from tests.conftest import RESEARCH_DONE, RESEARCH_PENDING, SEARCH_OK, USAGE_OK
 
 
 class ServerHandle:
@@ -150,7 +150,8 @@ async def test_full_flow_auth_search_failover(config, usage_first_tavily):
         async with Client(transport) as client:
             tools = await client.list_tools()
             assert {t.name for t in tools} >= {
-                "tavily_search", "tavily_extract", "tavily_crawl", "tavily_map", "get_my_usage",
+                "tavily_search", "tavily_extract", "tavily_crawl", "tavily_map",
+                "tavily_research", "get_my_usage",
             }
 
             # Script: key1 exhausted -> failover to another key succeeds.
@@ -191,6 +192,97 @@ async def test_rate_limit_kicks_in(config, usage_first_tavily):
             with pytest.raises(ToolError) as exc:
                 await client.call_tool("tavily_search", {"params": {"query": "x"}})
             assert "Rate limit" in str(exc.value)
+
+
+async def test_research_end_to_end(config, usage_first_tavily, monkeypatch):
+    """Full-tier token runs research through submit+poll; standard tier is gated."""
+    import app.mcp_server as m
+
+    monkeypatch.setattr(m, "RESEARCH_POLL_INTERVAL", 0.01)
+    async with running_server(config, usage_first_tavily) as (handle, state):
+        async with httpx.AsyncClient(base_url=handle.base) as client:
+            await client.post("/api/login", json={"password": "test-admin-pw"})
+            resp = await client.post(
+                "/api/tokens", json={"name": "researcher", "tier": "full"}
+            )
+            full_token = resp.json()["token"]
+            resp = await client.post(
+                "/api/tokens", json={"name": "basic", "tier": "standard"}
+            )
+            std_token = resp.json()["token"]
+
+        usage_first_tavily.responses.clear()
+        usage_first_tavily.queue("tvly-test-key-aaaa1111", RESEARCH_PENDING)
+        usage_first_tavily.default_response = RESEARCH_DONE
+
+        transport = StreamableHttpTransport(url=f"{handle.base}/mcp?token={full_token}")
+        async with Client(transport) as client:
+            result = await client.call_tool(
+                "tavily_research", {"params": {"input": "test topic"}}
+            )
+            text = result.content[0].text
+            assert "Research Report" in text
+            assert "https://example.com/1" in text
+
+        # The task was submitted and polled on the same key.
+        research_calls = [c for c in usage_first_tavily.calls if "research" in c[1]]
+        assert research_calls[0] == ("tvly-test-key-aaaa1111", "/research")
+        assert research_calls[-1] == ("tvly-test-key-aaaa1111", "/research/req_research_1")
+
+        # Standard tier is rejected by the tier gate before any upstream call.
+        calls_before = len(usage_first_tavily.calls)
+        transport = StreamableHttpTransport(url=f"{handle.base}/mcp?token={std_token}")
+        async with Client(transport) as client:
+            with pytest.raises(ToolError) as exc:
+                await client.call_tool(
+                    "tavily_research", {"params": {"input": "test topic"}}
+                )
+            assert "full-tier" in str(exc.value)
+        assert len(usage_first_tavily.calls) == calls_before
+
+
+async def test_token_tool_allowlist(config, usage_first_tavily):
+    """allowed_tools gates tools beyond the tier check; get_my_usage stays open."""
+    async with running_server(config, usage_first_tavily) as (handle, state):
+        async with httpx.AsyncClient(base_url=handle.base) as client:
+            await client.post("/api/login", json={"password": "test-admin-pw"})
+            resp = await client.post(
+                "/api/tokens",
+                json={"name": "restricted", "tier": "full", "allowed_tools": "tavily_search"},
+            )
+            token = resp.json()["token"]
+
+        usage_first_tavily.responses.clear()
+        usage_first_tavily.default_response = SEARCH_OK
+        transport = StreamableHttpTransport(url=f"{handle.base}/mcp?token={token}")
+        async with Client(transport) as client:
+            result = await client.call_tool("tavily_search", {"params": {"query": "hi"}})
+            assert "42" in result.content[0].text
+            # extract is not in the allowlist -> denied before any upstream call.
+            calls_before = len(usage_first_tavily.calls)
+            with pytest.raises(ToolError) as exc:
+                await client.call_tool(
+                    "tavily_extract", {"params": {"urls": ["https://example.com"]}}
+                )
+            assert "not enabled" in str(exc.value)
+            assert len(usage_first_tavily.calls) == calls_before
+            # Self-inspection is always allowed.
+            usage = await client.call_tool("get_my_usage", {})
+            assert "requests_today" in usage.content[0].text
+
+
+async def test_sync_all_endpoint(config, usage_first_tavily):
+    async with running_server(config, usage_first_tavily) as (handle, state):
+        async with httpx.AsyncClient(base_url=handle.base) as client:
+            await client.post("/api/login", json={"password": "test-admin-pw"})
+            r = await client.post("/api/keys/sync-all")
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["ok"] == 3
+            assert body["failed"] == 0
+            # Calibration from USAGE_OK is reflected in the pool.
+            for ks in state.pool.snapshot():
+                assert ks.credits_used_month == 150.0
 
 
 async def test_admin_key_test_button(config, usage_first_tavily):

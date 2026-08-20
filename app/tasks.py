@@ -53,6 +53,8 @@ async def usage_sync_loop(state: AppState, interval_hours: float) -> None:
                 "usage sync done: %(ok)d ok, %(failed)d failed, %(recovered)d recovered",
                 results,
             )
+            if state.alerts is not None:
+                await state.alerts.pool_check(state.pool)
         except Exception:
             logger.exception("usage sync loop crashed; retrying next interval")
         await asyncio.sleep(max(60.0, interval_hours * 3600.0))
@@ -70,6 +72,8 @@ async def maintenance_loop(state: AppState, retention_days: int) -> None:
             )
             await state.db.execute(cutoff_sql, (f"-{retention_days} days",))
             logger.info("log cleanup done (retention=%dd)", retention_days)
+            if state.alerts is not None:
+                await state.alerts.pool_check(state.pool)
         except Exception:
             logger.exception("maintenance loop crashed; retrying next interval")
         await asyncio.sleep(6 * 3600.0)

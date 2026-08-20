@@ -3,8 +3,8 @@
 #   docker compose up -d --build
 #
 # 服务组成:
-#   app    网关本体(MCP /mcp + 控制台 / + 管理 API),数据在命名卷 app-data。
-#          仅发布到宿主机回环地址,由宿主机 Nginx 终止 TLS 并反向代理。
+#   app    网关本体(MCP /mcp + 控制台 / 管理 API),数据在命名卷 app-data。
+#          发布到 ${APP_PORT:-8000},由宿主机 Nginx 终止 TLS 并反向代理。
 
 services:
   app:

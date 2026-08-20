@@ -18,7 +18,7 @@ services:
     volumes:
       - app-data:/data
     ports:
-      - "127.0.0.1:${APP_PORT:-8000}:8000"
+      - "10.0.0.8:${APP_PORT:-8000}:8000"
 
 volumes:
   app-data:

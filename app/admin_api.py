@@ -16,10 +16,12 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
 
+from .alerts import read_alert_settings
 from .config import SESSION_COOKIE, SESSION_MAX_AGE, Config
 from .mcp_server import TOKEN_PREFIX
 from .pool import day_start_ts, month_start_ts
 from .state import get_state
+from .tasks import sync_all_keys
 from .tavily import TavilyError, parse_usage
 
 logger = logging.getLogger("tavily_pool.admin")
@@ -58,6 +60,17 @@ def mask_key(key: str) -> str:
     if len(key) <= 12:
         return key[:4] + "…"
     return f"{key[:8]}…{key[-4:]}"
+
+
+def _normalize_allowed_tools(value: Any) -> Optional[str]:
+    """Accept a list or comma-separated string; None/empty → None (no restriction)."""
+    if isinstance(value, list):
+        cleaned = [str(t).strip() for t in value if str(t).strip()]
+    elif isinstance(value, str) and value.strip():
+        cleaned = [t.strip() for t in value.split(",") if t.strip()]
+    else:
+        return None
+    return ",".join(cleaned) or None
 
 
 def _fernet(session_secret: str) -> Fernet:
@@ -379,6 +392,12 @@ def build_admin_routes(config: Config) -> list[Route]:
         logger.info("key %s test ok in %sms: %s", key_id, latency, parsed)
         return JSONResponse(result)
 
+    async def keys_sync_all(request: Request) -> Response:
+        """Batch version of the test button: calibrate every key now."""
+        state = get_state()
+        results = await sync_all_keys(state)
+        return JSONResponse(results)
+
     # -- tokens ---------------------------------------------------------------
 
     async def tokens_list(request: Request) -> Response:
@@ -386,7 +405,7 @@ def build_admin_routes(config: Config) -> list[Route]:
         day0 = day_start_ts()
         month0 = month_start_ts()
         rows = await state.db.fetchall(
-            "SELECT id, name, prefix, tier, rpm_limit, daily_quota, "
+            "SELECT id, name, prefix, tier, allowed_tools, rpm_limit, daily_quota, "
             "monthly_credits_limit, is_active, last_used_at, created_at, revoked_at "
             "FROM access_tokens ORDER BY id"
         )
@@ -411,6 +430,7 @@ def build_admin_routes(config: Config) -> list[Route]:
                     "name": r["name"],
                     "prefix": r["prefix"],
                     "tier": r["tier"],
+                    "allowed_tools": r["allowed_tools"],
                     "rpm_limit": r["rpm_limit"],
                     "daily_quota": r["daily_quota"],
                     "monthly_credits_limit": r["monthly_credits_limit"],
@@ -441,15 +461,17 @@ def build_admin_routes(config: Config) -> list[Route]:
         raw = TOKEN_PREFIX + secrets.token_hex(20)
         token_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         token_enc = _fernet(config.session_secret).encrypt(raw.encode("utf-8")).decode("ascii")
+        allowed_tools = _normalize_allowed_tools(data.get("allowed_tools"))
         token_id = await state.db.execute(
-            "INSERT INTO access_tokens (name, token_hash, prefix, tier, rpm_limit, "
+            "INSERT INTO access_tokens (name, token_hash, prefix, tier, allowed_tools, rpm_limit, "
             "daily_quota, monthly_credits_limit, is_active, created_at, token_enc) "
-            "VALUES (?,?,?,?,?,?,?,1,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,1,?,?)",
             (
                 name,
                 token_hash,
                 raw[:12],
                 tier,
+                allowed_tools,
                 int(num("rpm_limit", config.default_token_rpm)),
                 int(num("daily_quota")) if num("daily_quota") is not None else None,
                 float(num("monthly_credits_limit"))
@@ -476,6 +498,8 @@ def build_admin_routes(config: Config) -> list[Route]:
             updates.append(("name", str(data["name"])))
         if "tier" in data and data["tier"] in ("standard", "full"):
             updates.append(("tier", data["tier"]))
+        if "allowed_tools" in data:
+            updates.append(("allowed_tools", _normalize_allowed_tools(data["allowed_tools"])))
         if "rpm_limit" in data and data["rpm_limit"] is not None:
             updates.append(("rpm_limit", int(data["rpm_limit"])))
         if "daily_quota" in data:
@@ -572,6 +596,7 @@ def build_admin_routes(config: Config) -> list[Route]:
                 "ts": r["ts"],
                 "token_name": r["token_name"] or (f"#{r['token_id']}" if r["token_id"] else "-"),
                 "tool": r["tool"],
+                "query": r["query"],
                 "tavily_key": mask_key(r["key_raw"]) if r["key_raw"] else "-",
                 "status": r["status"],
                 "http_status": r["http_status"],
@@ -623,12 +648,30 @@ def build_admin_routes(config: Config) -> list[Route]:
         site_name = await state.db.get_setting("site_name") or "Tavily Pool"
         announcement = await state.db.get_setting("announcement") or ""
         updated = await state.db.get_setting("announcement_updated_at")
+        cfg = await read_alert_settings(state.db)
         return JSONResponse(
             {
                 "site_name": site_name,
                 "announcement": announcement,
                 "announcement_updated_at": float(updated) if updated else None,
                 "has_custom_icon": (state.config.data_dir / "site_icon.bin").exists(),
+                "alert": {
+                    "channel": cfg["alert_channel"],
+                    "webhook_url": cfg["alert_webhook_url"],
+                    "webhook_secret": cfg["alert_webhook_secret"],
+                    "email_smtp_host": cfg["alert_email_smtp_host"],
+                    "email_smtp_port": int(cfg["alert_email_smtp_port"] or 465),
+                    "email_smtp_ssl": cfg["alert_email_use_ssl"] != "0",
+                    "email_username": cfg["alert_email_username"],
+                    "email_password": cfg["alert_email_password"],
+                    "email_from": cfg["alert_email_from"],
+                    "email_to": cfg["alert_email_to"],
+                    "on_key_disabled": cfg["alert_on_key_disabled"] == "1",
+                    "on_key_exhausted": cfg["alert_on_key_exhausted"] == "1",
+                    "on_pool_exhausted": cfg["alert_on_pool_exhausted"] == "1",
+                    "pool_min_active": int(float(cfg["alert_pool_min_active"] or 0)),
+                    "pool_min_remaining": float(cfg["alert_pool_min_remaining"] or 0),
+                },
             }
         )
 
@@ -642,7 +685,55 @@ def build_admin_routes(config: Config) -> list[Route]:
             text = str(data["announcement"]).strip()[:2000]
             await state.db.set_setting("announcement", text)
             await state.db.set_setting("announcement_updated_at", str(time.time()))
+        # -- alert configuration -------------------------------------------------
+        if "alert_channel" in data:
+            channel = str(data["alert_channel"]).strip()
+            if channel not in ("", "feishu", "wecom", "dingtalk", "generic", "email"):
+                return JSONResponse({"error": "未知告警渠道"}, status_code=400)
+            await state.db.set_setting("alert_channel", channel)
+        if "alert_webhook_url" in data:
+            await state.db.set_setting("alert_webhook_url", str(data["alert_webhook_url"]).strip()[:500])
+        if "alert_webhook_secret" in data:
+            await state.db.set_setting("alert_webhook_secret", str(data["alert_webhook_secret"]).strip()[:200])
+        # email channel (SMTP): host / port / ssl / mailbox / auth code / sender / recipients
+        if "alert_email_smtp_host" in data:
+            await state.db.set_setting("alert_email_smtp_host", str(data["alert_email_smtp_host"]).strip()[:200])
+        if "alert_email_smtp_port" in data:
+            try:
+                port = int(data["alert_email_smtp_port"])
+            except (TypeError, ValueError):
+                port = 465
+            await state.db.set_setting("alert_email_smtp_port", str(min(65535, max(1, port))))
+        if "alert_email_smtp_ssl" in data:
+            await state.db.set_setting("alert_email_use_ssl", "1" if data["alert_email_smtp_ssl"] else "0")
+        for key in (
+            "alert_email_username",
+            "alert_email_password",
+            "alert_email_from",
+            "alert_email_to",
+        ):
+            if key in data:
+                await state.db.set_setting(key, str(data[key]).strip()[:500])
+        for key in ("alert_on_key_disabled", "alert_on_key_exhausted", "alert_on_pool_exhausted"):
+            if key in data:
+                await state.db.set_setting(key, "1" if data[key] else "0")
+        for key, cast in (("alert_pool_min_active", int), ("alert_pool_min_remaining", float)):
+            if key in data:
+                try:
+                    value = max(0, cast(data[key] or 0))
+                except (TypeError, ValueError):
+                    value = 0
+                await state.db.set_setting(key, str(value))
+        if state.alerts is not None:
+            state.alerts.invalidate_cache()
         return JSONResponse({"ok": True})
+
+    async def settings_alert_test(request: Request) -> Response:
+        state = get_state()
+        if state.alerts is None:
+            return JSONResponse({"ok": False, "error": "告警模块未启用"}, status_code=500)
+        ok, error = await state.alerts.send_test()
+        return JSONResponse({"ok": ok, "error": error or None})
 
     async def settings_icon_upload(request: Request) -> Response:
         state = get_state()
@@ -696,6 +787,7 @@ def build_admin_routes(config: Config) -> list[Route]:
         Route("/api/stats/daily", admin(stats_daily), methods=["GET"]),
         Route("/api/keys", admin(keys_list), methods=["GET"]),
         Route("/api/keys", admin(keys_create), methods=["POST"]),
+        Route("/api/keys/sync-all", admin(keys_sync_all), methods=["POST"]),
         Route("/api/keys/{key_id:int}", admin(key_patch), methods=["PATCH"]),
         Route("/api/keys/{key_id:int}", admin(key_delete), methods=["DELETE"]),
         Route("/api/keys/{key_id:int}/test", admin(key_test), methods=["POST"]),
@@ -709,6 +801,7 @@ def build_admin_routes(config: Config) -> list[Route]:
         Route("/site-icon", site_icon, methods=["GET"]),
         Route("/api/settings", admin(settings_get), methods=["GET"]),
         Route("/api/settings", admin(settings_update), methods=["PUT"]),
+        Route("/api/settings/alert-test", admin(settings_alert_test), methods=["POST"]),
         Route("/api/settings/icon", admin(settings_icon_upload), methods=["POST"]),
         Route("/api/settings/icon", admin(settings_icon_delete), methods=["DELETE"]),
         Route("/api/settings/password", admin(settings_password), methods=["POST"]),

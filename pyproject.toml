@@ -13,6 +13,7 @@ dependencies = [
     "itsdangerous>=2.2",
     "pydantic>=2.11",
     "cryptography>=50.0.0",
+    "prometheus-client>=0.26.0",
 ]
 
 [dependency-groups]

@@ -76,7 +76,7 @@ function CopyRow({
 export default function TokensPage() {
   const [tokens, setTokens] = useState<TokenItem[] | null>(null)
   const [createOpen, setCreateOpen] = useState(false)
-  const [form, setForm] = useState({ name: '', tier: 'standard', rpm: '30', daily: '', monthly: '' })
+  const [form, setForm] = useState({ name: '', tier: 'standard', rpm: '30', daily: '', monthly: '', tools: '' })
   const [creating, setCreating] = useState(false)
   const [created, setCreated] = useState<CreatedToken | null>(null)
   const [copied, setCopied] = useState<string | null>(null)
@@ -101,11 +101,12 @@ export default function TokensPage() {
       }
       if (form.daily.trim()) payload.daily_quota = Number(form.daily)
       if (form.monthly.trim()) payload.monthly_credits_limit = Number(form.monthly)
+      if (form.tools.trim()) payload.allowed_tools = form.tools.trim()
       const result = await api.createToken(payload)
       setCreateOpen(false)
       setCreated(result)
       setCopied(null)
-      setForm({ name: '', tier: 'standard', rpm: '30', daily: '', monthly: '' })
+      setForm({ name: '', tier: 'standard', rpm: '30', daily: '', monthly: '', tools: '' })
       refresh()
     } catch (e) {
       toast.error(e instanceof Error ? e.message : '创建失败')
@@ -263,7 +264,7 @@ export default function TokensPage() {
           <DialogHeader>
             <DialogTitle>创建访问 Token</DialogTitle>
             <DialogDescription>
-              明文 Token 只在创建后显示一次。「完整」等级才能调用 crawl / map。
+              明文 Token 只在创建后显示一次。「完整」等级才能调用 crawl / map / research。
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
@@ -320,6 +321,19 @@ export default function TokensPage() {
                   onChange={(e) => setForm({ ...form, monthly: e.target.value })}
                 />
               </div>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="ttools">允许的工具(可选)</Label>
+              <Input
+                id="ttools"
+                value={form.tools}
+                onChange={(e) => setForm({ ...form, tools: e.target.value })}
+                placeholder="留空允许全部;如 tavily_search,tavily_extract"
+                className="font-mono text-xs"
+              />
+              <p className="text-xs text-muted-foreground">
+                逗号分隔的工具白名单,get_my_usage 始终可用;等级门禁(crawl/map/research 需完整等级)仍然生效
+              </p>
             </div>
           </div>
           <DialogFooter>

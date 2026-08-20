@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { FlaskConical, Loader2, Plus, RefreshCcw, Trash2 } from 'lucide-react'
+import { FlaskConical, Gauge, Loader2, Plus, RefreshCcw, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -133,6 +133,7 @@ export default function KeysPage() {
   const [addLabel, setAddLabel] = useState('')
   const [addLimit, setAddLimit] = useState('1000')
   const [adding, setAdding] = useState(false)
+  const [syncing, setSyncing] = useState(false)
 
   const refresh = useCallback(() => {
     api
@@ -200,6 +201,21 @@ export default function KeysPage() {
     }
   }
 
+  const handleSyncAll = async () => {
+    setSyncing(true)
+    try {
+      const r = await api.syncAllKeys()
+      const parts = [`成功 ${r.ok} / 失败 ${r.failed}`]
+      if (r.recovered) parts.push(`恢复耗尽 key ${r.recovered} 个`)
+      toast.success(`全量校准完成:${parts.join(' · ')}`)
+      refresh()
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : '校准失败')
+    } finally {
+      setSyncing(false)
+    }
+  }
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -213,6 +229,10 @@ export default function KeysPage() {
           <Button variant="outline" onClick={refresh}>
             <RefreshCcw className="size-4" />
             刷新
+          </Button>
+          <Button variant="outline" disabled={syncing} onClick={handleSyncAll}>
+            {syncing ? <Loader2 className="size-4 animate-spin" /> : <Gauge className="size-4" />}
+            {syncing ? '校准中…' : '全量校准'}
           </Button>
           <Button onClick={() => setAddOpen(true)}>
             <Plus className="size-4" />
